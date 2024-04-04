@@ -74,6 +74,8 @@ def calculate_(species: Sequence[v.Species], phases: Sequence[str],
     points_dict = unpack_kwarg(points, default_arg=None)
     pdens_dict = unpack_kwarg(pdens, default_arg=50)
     nonvacant_components = [x for x in sorted(species) if x.number_of_atoms > 0]
+    cur_phase_local_conditions = {} # XXX: Temporary hack to allow compatibility
+    str_phase_local_conditions = {} # XXX: Temporary hack to allow compatibility
     maximum_internal_dof = max(prx.phase_dof for prx in phase_records.values())
     all_phase_data = []
     for phase_name in sorted(phases):
@@ -81,11 +83,11 @@ def calculate_(species: Sequence[v.Species], phases: Sequence[str],
         phase_record = phase_records[phase_name]
         points = points_dict[phase_name]
         if points is None:
-            points = _sample_phase_constitution(mod, point_sample, True, pdens_dict[phase_name])
+            points = _sample_phase_constitution(mod, point_sample, True, pdens_dict[phase_name], cur_phase_local_conditions)
         points = np.atleast_2d(points)
 
         fp = fake_points and (phase_name == sorted(phases)[0])
-        phase_ds = _compute_phase_values(nonvacant_components, str_statevar_dict,
+        phase_ds = _compute_phase_values(nonvacant_components, str_statevar_dict, str_phase_local_conditions,
                                          points, phase_record, output,
                                          maximum_internal_dof, broadcast=broadcast,
                                          largest_energy=float(1e10), fake_points=fp,
@@ -125,12 +127,12 @@ def constrained_equilibrium(phase_records: Dict[str, PhaseRecord],
     statevars = get_state_variables(conds=conditions)
     conditions = _adjust_conditions(conditions)
     # Assume that all conditions keys are lists with exactly one element (point calculation)
-    str_conds = OrderedDict([(str(ky), conditions[ky].to(ky.implementation_units).magnitude) for ky in sorted(conditions.keys(), key=str)])
+    unitless_conds = OrderedDict([(ky, conditions[ky].to(ky.implementation_units).magnitude) for ky in sorted(conditions.keys(), key=str)])
     compset = _single_phase_start_point(conditions, statevars, phase_records, grid)
     solution_compsets = [compset]
     solver = Solver()
     # modifies `solution_compsets` and `compset` in place
-    solver_result = solver.solve(solution_compsets, str_conds)
+    solver_result = solver.solve(solution_compsets, unitless_conds)
     energy = compset.NP * compset.energy
     return solver_result.converged, energy
 
