@@ -12,7 +12,7 @@ import pickle
 import scipy.stats
 from tinydb import where
 
-from pycalphad import Database, Model, variables as v
+from pycalphad import Database
 
 from espei.paramselect import generate_parameters
 from espei.error_functions import *

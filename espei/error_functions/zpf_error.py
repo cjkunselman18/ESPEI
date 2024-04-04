@@ -21,8 +21,7 @@ from typing import Sequence, Dict, Any, Union, List, Tuple, Type, Optional
 
 import numpy as np
 from numpy.typing import ArrayLike
-from pycalphad import Database, Model, variables as v
-from pycalphad.codegen.callables import build_phase_records
+from pycalphad import Database, Model, Workspace, variables as v
 from pycalphad.core.utils import instantiate_models, filter_phases, unpack_components
 from pycalphad.core.phase_rec import PhaseRecord
 from pycalphad.core.calculate import _sample_phase_constitution
@@ -162,18 +161,18 @@ def get_zpf_data(dbf: Database, comps: Sequence[str], phases: Sequence[str], dat
     desired_data = datasets.search((tinydb.where('output') == 'ZPF') &
                                    (tinydb.where('components').test(lambda x: set(x).issubset(comps))) &
                                    (tinydb.where('phases').test(lambda x: len(set(phases).intersection(x)) > 0)))
+    wks = Workspace(dbf, comps, phases)
 
     zpf_data = []  # 1:1 correspondence with each dataset
     for data in desired_data:
+        current_wks = wks.copy()
         data_comps = list(set(data['components']).union({'VA'}))
-        species = sorted(unpack_components(dbf, data_comps), key=str)
-        data_phases = filter_phases(dbf, species, candidate_phases=phases)
-        models = instantiate_models(dbf, species, data_phases, model=model, parameters=parameters)
-        # assumed N, P, T state variables
-        phase_recs = build_phase_records(dbf, species, data_phases, {v.N, v.P, v.T}, models, parameters=parameters, build_gradients=True, build_hessians=True)
-        all_phase_points = {phase_name: _sample_phase_constitution(models[phase_name], point_sample, True, 50) for phase_name in data_phases}
         all_regions = data['values']
         conditions = data['conditions']
+        current_wks.components = data_comps
+        current_wks.conditions = conditions
+        current_wks.phases = phases
+        models = current_wks.models
         phase_regions = []
         # Each phase_region is one set of phases in equilibrium (on a tie-line),
         # e.g. [["ALPHA", ["B"], [0.25]], ["BETA", ["B"], [0.5]]]
@@ -190,7 +189,7 @@ def get_zpf_data(dbf: Database, comps: Sequence[str], phases: Sequence[str], dat
                 if phase_name.upper() == '__HYPERPLANE__':
                     if np.any(np.isnan(composition)):  # TODO: make this a part of the dataset checker
                         raise ValueError(f"__HYPERPLANE__ vertex ({vertex}) must have all independent compositions defined to make a well-defined hyperplane (from dataset: {data})")
-                    vtx = RegionVertex(phase_name, composition, comp_conds, None, phase_recs, disordered_flag, False)
+                    vtx = RegionVertex(phase_name, composition, comp_conds, None, current_wks.phase_record_factory, disordered_flag, False)
                     hyperplane_vertices.append(vtx)
                     continue
                 # Construct single-phase points satisfying the conditions for each phase in the region
@@ -204,16 +203,18 @@ def get_zpf_data(dbf: Database, comps: Sequence[str], phases: Sequence[str], dat
                     phase_points = None
                 else:
                     has_missing_comp_cond = False
-                    # Only sample points that have an average mass residual within tol
-                    tol = 0.02
-                    phase_points = _subsample_phase_points(phase_recs[phase_name], all_phase_points[phase_name], composition, tol)
+                    vertex_wks = current_wks.copy()
+                    vertex_wks.phases = [phase_name]
+                    vertex_wks.conditions = {**pot_conds, **comp_conds}
+                    compset = next(vertex_wks.enumerate_composition_sets())[1][0]
+                    phase_points = np.array([compset.dof[len(compset.phase_record.state_variables):]])
                     assert phase_points.shape[0] > 0, f"phase {phase_name} must have at least one set of points within the target tolerance {pot_conds} {comp_conds}"
-                vtx = RegionVertex(phase_name, composition, comp_conds, phase_points, phase_recs, disordered_flag, has_missing_comp_cond)
+                vtx = RegionVertex(phase_name, composition, comp_conds, phase_points, current_wks.phase_record_factory, disordered_flag, has_missing_comp_cond)
                 vertices.append(vtx)
             if len(hyperplane_vertices) == 0:
                 # Define the hyperplane at the vertices of the ZPF points
                 hyperplane_vertices = vertices
-            region = PhaseRegion(hyperplane_vertices, vertices, pot_conds, species, data_phases, models)
+            region = PhaseRegion(hyperplane_vertices, vertices, pot_conds, current_wks.components, current_wks.phases, models)
             phase_regions.append(region)
 
         data_dict = {
