@@ -12,9 +12,8 @@ import numpy as np
 import numpy.typing as npt
 from symengine import Symbol
 from tinydb import where
-
+from pycalphad.codegen.phase_record_factory import PhaseRecordFactory
 from pycalphad import Database, Model, ReferenceState, variables as v
-from pycalphad.codegen.callables import build_phase_records
 from pycalphad.core.utils import unpack_components, get_pure_elements, filter_phases
 
 from espei.datasets import Dataset
@@ -286,7 +285,7 @@ def get_thermochemical_data(dbf, comps, phases, datasets, model=None, weight_dic
                 model_cls = model.get(phase_name, Model)
                 mod = model_cls(dbf, comps, phase_name, parameters=symbols_to_fit)
                 if prop.endswith('_FORM'):
-                    output = ''.join(prop.split('_')[:-1])+'R'
+                    output = ''.join(prop.split('_')[:-1])
                     mod.shift_reference_state(ref_states, dbf, contrib_mods={e: symengine.S.Zero for e in exclusion})
                 else:
                     output = prop
@@ -298,15 +297,14 @@ def get_thermochemical_data(dbf, comps, phases, datasets, model=None, weight_dic
                         mod.endmember_reference_model.models[contrib] = symengine.S.Zero
                     except AttributeError:
                         mod.reference_model.models[contrib] = symengine.S.Zero
+                model_dict = {phase_name: mod}
                 species = sorted(unpack_components(dbf, comps), key=str)
                 data_dict['species'] = species
-                model_dict = {phase_name: mod}
                 statevar_dict = {getattr(v, c, None): vals for c, vals in calculate_dict.items() if isinstance(getattr(v, c, None), v.StateVariable)}
                 statevar_dict = OrderedDict(sorted(statevar_dict.items(), key=lambda x: str(x[0])))
+                phase_records = PhaseRecordFactory(dbf, species, statevar_dict, model_dict,
+                                                   parameters={s: 0 for s in symbols_to_fit})
                 str_statevar_dict = OrderedDict((str(k), vals) for k, vals in statevar_dict.items())
-                phase_records = build_phase_records(dbf, species, [phase_name], statevar_dict, model_dict,
-                                                    output=output, parameters={s: 0 for s in symbols_to_fit},
-                                                    build_gradients=False, build_hessians=False)
                 data_dict['str_statevar_dict'] = str_statevar_dict
                 data_dict['phase_records'] = phase_records
                 data_dict['calculate_dict'] = calculate_dict

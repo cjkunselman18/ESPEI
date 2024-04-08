@@ -11,12 +11,11 @@ import numpy.typing as npt
 import tinydb
 from tinydb import where
 from scipy.stats import norm
-from pycalphad.plot.eqplot import _map_coord_to_variable
 from pycalphad import Database, Model, ReferenceState, variables as v
-from pycalphad.core.equilibrium import _eqcalculate
 from pycalphad.codegen.callables import build_phase_records
 from pycalphad.core.utils import instantiate_models, filter_phases, extract_parameters, unpack_components, unpack_condition
 from pycalphad.core.phase_rec import PhaseRecord
+from pycalphad import Workspace, as_property
 
 from espei.error_functions.residual_base import ResidualFunction, residual_function_registry
 from espei.phase_models import PhaseModelSpecification
@@ -210,24 +209,17 @@ def calc_prop_differences(eqpropdata: EqPropData,
     phase_records = eqpropdata.phase_records
     update_phase_record_parameters(phase_records, parameters)
     params_dict = OrderedDict(zip(map(str, eqpropdata.params_keys), parameters))
-    output = eqpropdata.output
+    output = as_property(eqpropdata.output)
     weights = np.array(eqpropdata.weight, dtype=np.float_)
     samples = np.array(eqpropdata.samples, dtype=np.float_)
+    wks = Workspace(database=dbf, components=species, phases=phases, phase_record_factory=phase_records)
 
     calculated_data = []
     for comp_conds in eqpropdata.composition_conds:
         cond_dict = OrderedDict(**pot_conds, **comp_conds)
-        # str_statevar_dict must be sorted, assumes that pot_conds are.
-        str_statevar_dict = OrderedDict([(str(key), vals) for key, vals in pot_conds.items()])
-        grid = calculate_(species, phases, str_statevar_dict, models, phase_records, pdens=50, fake_points=True)
-        multi_eqdata = _equilibrium(phase_records, cond_dict, grid)
-        # TODO: could be kind of slow. Callables (which are cachable) must be built.
-        propdata = _eqcalculate(dbf, species, phases, cond_dict, output, data=multi_eqdata, per_phase=False, callables=None, parameters=params_dict, model=models)
-
-        if 'vertex' in propdata.data_vars[output][0]:
-            raise ValueError(f"Property {output} cannot be used to calculate equilibrium thermochemical error because each phase has a unique value for this property.")
-
-        vals = getattr(propdata, output).flatten().tolist()
+        wks.conditions = cond_dict
+        wks.parameters = params_dict
+        vals = wks.get(output)[0].to(output.implementation_units).magnitude
         calculated_data.extend(vals)
 
     calculated_data = np.array(calculated_data, dtype=np.float_)
