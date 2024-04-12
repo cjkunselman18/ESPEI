@@ -8,6 +8,7 @@ from typing import Sequence, Dict, Optional
 from numpy.typing import ArrayLike
 import numpy as np
 from pycalphad import Model, variables as v
+from pycalphad.codegen.phase_record_factory import PhaseRecordFactory
 from pycalphad.core.phase_rec import PhaseRecord
 from pycalphad.core.composition_set import CompositionSet
 from pycalphad.core.starting_point import starting_point
@@ -19,13 +20,9 @@ from pycalphad.core.calculate import _sample_phase_constitution, _compute_phase_
 from pycalphad.core.solver import Solver
 
 
-def update_phase_record_parameters(phase_records: Dict[str, PhaseRecord], parameters: ArrayLike) -> None:
+def update_phase_record_parameters(phase_record_factory: PhaseRecordFactory, parameters: ArrayLike) -> None:
     if parameters.size > 0:
-        for phase_name, phase_record in phase_records.items():
-            # very important that these are floats, otherwise parameters can end up
-            # with garbage data. `np.asarray` does not create a copy if the type is
-            # correct
-            phase_record.parameters[:] = np.asarray(parameters, dtype=np.float_)
+        phase_record_factory.param_values[:] = np.asarray(parameters, dtype=np.float_)
 
 def _single_phase_start_point(conditions, state_variables, phase_records, grid):
     """Return a single CompositionSet object to use in a point calculation
