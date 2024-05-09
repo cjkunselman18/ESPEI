@@ -16,6 +16,7 @@ from pycalphad.codegen.callables import build_phase_records
 from pycalphad.core.utils import instantiate_models, filter_phases, extract_parameters, unpack_components, unpack_condition
 from pycalphad.core.phase_rec import PhaseRecord
 from pycalphad import Workspace, as_property
+from pycalphad.property_framework import DotDerivativeComputedProperty
 
 from espei.error_functions.residual_base import ResidualFunction, residual_function_registry
 from espei.phase_models import PhaseModelSpecification
@@ -173,7 +174,7 @@ def get_equilibrium_thermochemical_data(dbf: Database, comps: Sequence[str],
 def calc_prop_differences(eqpropdata: EqPropData,
                           parameters: np.ndarray,
                           approximate_equilibrium: Optional[bool] = False,
-                          ) -> Tuple[np.ndarray, np.ndarray]:
+                          ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Calculate differences between the expected and calculated values for a property
 
@@ -200,7 +201,11 @@ def calc_prop_differences(eqpropdata: EqPropData,
         _equilibrium = no_op_equilibrium_
     else:
         _equilibrium = equilibrium_
-
+        
+    param_update_dict = {}
+    for param in eqpropdata.params_keys:
+        param_update_dict[str(param)] = v.IndependentPotential(str(param))
+        
     dbf = eqpropdata.dbf
     species = eqpropdata.species
     phases = eqpropdata.phases
@@ -215,26 +220,33 @@ def calc_prop_differences(eqpropdata: EqPropData,
     wks = Workspace(database=dbf, components=species, phases=phases, phase_record_factory=phase_records)
 
     calculated_data = []
+    gradient_data = []
     for comp_conds in eqpropdata.composition_conds:
         cond_dict = OrderedDict(**pot_conds, **comp_conds)
         wks.conditions = cond_dict
         wks.parameters = params_dict
         vals = wks.get(output)[0].to(output.implementation_units).magnitude
         calculated_data.extend(vals)
+        gradient_props = [DotDerivativeComputedProperty(output[output.implementation_units], param_update_dict[key]) for key in param_update_dict]
+        gradients = wks.get(*gradient_props)
+        gradients_magnitude = [element.magnitude for element in gradients]
+        gradient_data.append(gradients_magnitude)
 
     calculated_data = np.array(calculated_data, dtype=np.float_)
+    gradient_data = np.array(gradient_data, dtype=np.float)
 
     assert calculated_data.shape == samples.shape, f"Calculated data shape {calculated_data.shape} does not match samples shape {samples.shape}"
     assert calculated_data.shape == weights.shape, f"Calculated data shape {calculated_data.shape} does not match weights shape {weights.shape}"
+    assert gradient_data.shape == calculated_data.shape + (len(params_dict),), f"Calculated data shape {gradient_data.shape} does not match calculated data shape {calculated_data.shape} and parameters length {len(params_dict)}"
     differences = calculated_data - samples
     _log.debug('Output: %s differences: %s, weights: %s, reference: %s', output, differences, weights, eqpropdata.reference)
-    return differences, weights
+    return differences, weights, gradient_data
 
 
 def calculate_equilibrium_thermochemical_probability(eq_thermochemical_data: Sequence[EqPropData],
                                                      parameters: np.ndarray,
                                                      approximate_equilibrium: Optional[bool] = False,
-                                                     ) -> float:
+                                                     ) -> Tuple[float,List[float]]:
     """
     Calculate the total equilibrium thermochemical probability for all EqPropData
 
@@ -259,19 +271,23 @@ def calculate_equilibrium_thermochemical_probability(eq_thermochemical_data: Seq
 
     differences = []
     weights = []
+    gradients = []
     for eqpropdata in eq_thermochemical_data:
-        diffs, wts = calc_prop_differences(eqpropdata, parameters, approximate_equilibrium)
+        diffs, wts, grads = calc_prop_differences(eqpropdata, parameters, approximate_equilibrium)
         if np.any(np.isinf(diffs) | np.isnan(diffs)):
             # NaN or infinity are assumed calculation failures. If we are
             # calculating log-probability, just bail out and return -infinity.
             return -np.inf
         differences.append(diffs)
         weights.append(wts)
+        gradients.append(grads)
 
     differences = np.concatenate(differences, axis=0)
     weights = np.concatenate(weights, axis=0)
+    gradients = np.concatenate(gradients, axis=0)
     probs = norm(loc=0.0, scale=weights).logpdf(differences)
-    return np.sum(probs)
+    grad_probs = -differences*gradients/weights**2
+    return np.sum(probs), np.sum(grad_probs, axis=0)
 
 
 class EquilibriumPropertyResidual(ResidualFunction):
@@ -312,9 +328,9 @@ class EquilibriumPropertyResidual(ResidualFunction):
             weights.extend(dataset_weights.tolist())
         return residuals, weights
 
-    def get_likelihood(self, parameters) -> float:
-        likelihood = calculate_equilibrium_thermochemical_probability(self.property_data, parameters)
-        return likelihood
+    def get_likelihood(self, parameters) -> Tuple[float,List[float]]:
+        likelihood, gradients = calculate_equilibrium_thermochemical_probability(self.property_data, parameters)
+        return likelihood, gradients
 
 
 residual_function_registry.register(EquilibriumPropertyResidual)
