@@ -22,6 +22,7 @@ from typing import Sequence, Dict, Any, Union, List, Tuple, Type, Optional
 import numpy as np
 from numpy.typing import ArrayLike
 from pycalphad import Database, Model, Workspace, variables as v
+from pycalphad.property_framework import DotDerivativeComputedProperty, IsolatedPhase
 from pycalphad.core.utils import instantiate_models, filter_phases, unpack_components
 from pycalphad.core.phase_rec import PhaseRecord
 from pycalphad.core.calculate import _sample_phase_constitution
@@ -161,7 +162,8 @@ def get_zpf_data(dbf: Database, comps: Sequence[str], phases: Sequence[str], dat
     desired_data = datasets.search((tinydb.where('output') == 'ZPF') &
                                    (tinydb.where('components').test(lambda x: set(x).issubset(comps))) &
                                    (tinydb.where('phases').test(lambda x: len(set(phases).intersection(x)) > 0)))
-    wks = Workspace(dbf, comps, phases)
+    wks = Workspace(dbf, comps, phases, models=model, parameters=parameters)
+    
 
     zpf_data = []  # 1:1 correspondence with each dataset
     for data in desired_data:
@@ -172,7 +174,7 @@ def get_zpf_data(dbf: Database, comps: Sequence[str], phases: Sequence[str], dat
         current_wks.components = data_comps
         current_wks.conditions = conditions
         current_wks.phases = phases
-        models = current_wks.models
+        models = current_wks.models.unwrap()
         phase_regions = []
         # Each phase_region is one set of phases in equilibrium (on a tie-line),
         # e.g. [["ALPHA", ["B"], [0.25]], ["BETA", ["B"], [0.5]]]
@@ -220,13 +222,15 @@ def get_zpf_data(dbf: Database, comps: Sequence[str], phases: Sequence[str], dat
         data_dict = {
             'weight': data.get('weight', 1.0),
             'phase_regions': phase_regions,
-            'dataset_reference': data['reference']
+            'dataset_reference': data['reference'],
+            'dbf': dbf,
+            'parameter_dict': parameters
         }
         zpf_data.append(data_dict)
     return zpf_data
 
 
-def estimate_hyperplane(phase_region: PhaseRegion, parameters: np.ndarray, approximate_equilibrium: bool = False) -> np.ndarray:
+def estimate_hyperplane(phase_region: PhaseRegion, dbf: Database, parameter_dict, parameters: np.ndarray, approximate_equilibrium: bool = False) -> Tuple[np.ndarray, np.ndarray]:
     """
     Calculate the chemical potentials for the target hyperplane, one vertex at a time
 
@@ -239,12 +243,14 @@ def estimate_hyperplane(phase_region: PhaseRegion, parameters: np.ndarray, appro
     are taken as the target hyperplane for the given equilibria.
 
     """
+    
     if approximate_equilibrium:
         _equilibrium = no_op_equilibrium_
     else:
         _equilibrium = equilibrium_
     target_hyperplane_chempots = []
     target_hyperplane_phases = []
+    target_hyperplane_chempots_grads = []
     species = phase_region.species
     phases = phase_region.phases
     models = phase_region.models
@@ -252,39 +258,56 @@ def estimate_hyperplane(phase_region: PhaseRegion, parameters: np.ndarray, appro
         phase_records = vertex.phase_records
         update_phase_record_parameters(phase_records, parameters)
         cond_dict = {**vertex.comp_conds, **phase_region.potential_conds}
+        # can you append parameters as potentials in the conditions dict here?
+        params_keys = []
+        for key in parameter_dict.keys():
+            if not hasattr(v, key):
+                setattr(v, key, v.IndependentPotential(key))
+            params_keys.append(getattr(v, key))
+            dbf.symbols.pop(key,None)
+            
+        for index in range(len(parameters)):
+            cond_dict.update({params_keys[index]: parameters[index]})
+        
+        wks = Workspace(database=dbf, components=species, phases=phases,  phase_record_factory=phase_records, conditions=cond_dict)
         if vertex.has_missing_comp_cond:
             # This composition is unknown -- it doesn't contribute to hyperplane estimation
             pass
         else:
             # Extract chemical potential hyperplane from multi-phase calculation
             # Note that we consider all phases in the system, not just ones in this tie region
-            str_statevar_dict = OrderedDict([(str(key), cond_dict[key]) for key in sorted(phase_region.potential_conds.keys(), key=str)])
-            grid = calculate_(species, phases, str_statevar_dict, models, phase_records, pdens=50, fake_points=True)
-            multi_eqdata = _equilibrium(phase_records, cond_dict, grid)
-            target_hyperplane_phases.append(multi_eqdata.Phase.squeeze())
-            # Does there exist only a single phase in the result with zero internal degrees of freedom?
-            # We should exclude those chemical potentials from the average because they are meaningless.
-            num_phases = np.sum(multi_eqdata.Phase.squeeze() != '')
-            Y_values = multi_eqdata.Y.squeeze()
+            # Extract chemical potential hyperplane from multi-phase calculation
+            # Note that we consider all phases in the system, not just ones in this tie region
+            MU_values = [wks.get(v.MU(comp))[0] for comp in species if comp != v.Species('VA')]
+            gradient_params = [DotDerivativeComputedProperty(v.MU(spc), key) for spc in species if spc != v.Species('VA') for key in parameter_dict]
+            gradients = wks.get(*gradient_params)
+            gradients_magnitude = [float(element.magnitude) for element in gradients]
+            gradients_magnitude = np.reshape(gradients_magnitude,(len(MU_values),len(parameter_dict)))
+            num_phases = np.sum(wks.eq.Phase.squeeze() != '')
+            Y_values = wks.eq.Y.squeeze()
             no_internal_dof = np.all((np.isclose(Y_values, 1.)) | np.isnan(Y_values))
-            MU_values = multi_eqdata.MU.squeeze()
             if (num_phases == 1) and no_internal_dof:
                 target_hyperplane_chempots.append(np.full_like(MU_values, np.nan))
             else:
                 target_hyperplane_chempots.append(MU_values)
-    target_hyperplane_mean_chempots = np.nanmean(target_hyperplane_chempots, axis=0, dtype=np.float_)
-    return target_hyperplane_mean_chempots
+                target_hyperplane_chempots_grads.append(gradients_magnitude)
+    target_hyperplane_mean_chempots = np.nanmean(target_hyperplane_chempots, axis=0, dtype=np.float_) 
+    target_hyperplane_chempots_grads = np.nanmean(target_hyperplane_chempots_grads, axis=0, dtype=np.float_) 
+    return target_hyperplane_mean_chempots, target_hyperplane_chempots_grads
 
 
-def driving_force_to_hyperplane(target_hyperplane_chempots: np.ndarray,
-                                phase_region: PhaseRegion, vertex: RegionVertex,
-                                parameters: np.ndarray, approximate_equilibrium: bool = False) -> float:
+def driving_force_to_hyperplane(target_hyperplane_chempots: np.ndarray, target_hyperplane_chempots_grads: np.ndarray,
+                                phase_region: PhaseRegion, dbf: Database, parameter_dict, vertex: RegionVertex,
+                                parameters: np.ndarray, approximate_equilibrium: bool = False) -> Tuple[float,List[float]]:
     """Calculate the integrated driving force between the current hyperplane and target hyperplane.
     """
     species = phase_region.species
     models = phase_region.models
     current_phase = vertex.phase_name
     cond_dict = {**phase_region.potential_conds, **vertex.comp_conds}
+    params_keys = list(parameter_dict.keys())
+    for index in range(len(parameters)):
+        cond_dict.update({params_keys[index]: parameters[index]})
     str_statevar_dict = OrderedDict([(str(key),cond_dict[key]) for key in sorted(phase_region.potential_conds.keys(), key=str)])
     phase_points = vertex.points
     phase_records = vertex.phase_records
@@ -323,22 +346,23 @@ def driving_force_to_hyperplane(target_hyperplane_chempots: np.ndarray,
         driving_force = np.multiply(target_hyperplane_chempots, single_eqdata.X).sum(axis=-1) - single_eqdata.GM
         driving_force = float(np.squeeze(driving_force))
     else:
-        # Extract energies from single-phase calculations
-        grid = calculate_(species, [current_phase], str_statevar_dict, models, phase_records, points=phase_points, pdens=50, fake_points=True)
-        # TODO: consider enabling approximate for this?
-        converged, energy = constrained_equilibrium(phase_records, cond_dict, grid)
-        if not converged:
-            _log.debug('Calculation failure: constrained equilibrium not converged for %s, conditions: %s, parameters %s', current_phase, cond_dict, parameters)
-            return np.inf
-        driving_force = float(np.dot(target_hyperplane_chempots, vertex.composition) - float(energy))
-    return driving_force
+        wks = Workspace(database=dbf, components=species, phases=current_phase,  phase_record_factory=phase_records, conditions=cond_dict)
+        constrained_energy = wks.get(IsolatedPhase(current_phase,wks=wks)('GM'))[0].magnitude
+        driving_force = np.dot(np.squeeze(target_hyperplane_chempots), vertex.composition) - constrained_energy
+        gradient_params = [DotDerivativeComputedProperty(IsolatedPhase(current_phase, wks=wks)('GM'), key) for key in parameter_dict]
+        gradients = wks.get(*gradient_params)
+        constrained_energy_gradient = [float(element.magnitude) for element in gradients]
+        driving_force_gradient = np.squeeze(np.matmul(np.reshape(vertex.composition,(1,-1)),target_hyperplane_chempots_grads) - constrained_energy_gradient)
+        
+        
+    return driving_force, driving_force_gradient
 
 
 def calculate_zpf_driving_forces(zpf_data: Sequence[Dict[str, Any]],
                                  parameters: ArrayLike = None,
                                  approximate_equilibrium: bool = False,
                                  short_circuit: bool = False
-                                 ) -> Tuple[List[List[float]], List[List[float]]]:
+                                 ) -> Tuple[List[List[float]], List[List[float]], List[List[float]]]:
     """
     Calculate error due to phase equilibria data
 
@@ -372,24 +396,27 @@ def calculate_zpf_driving_forces(zpf_data: Sequence[Dict[str, Any]],
         parameters = np.array([])
     driving_forces = []
     weights = []
+    gradients = []
     for data in zpf_data:
         data_driving_forces = []
         data_weights = []
+        data_gradients = []
         weight = data['weight']
         dataset_ref = data['dataset_reference']
         # for the set of phases and corresponding tie-line verticies in equilibrium
         for phase_region in data['phase_regions']:
             # 1. Calculate the average multiphase hyperplane
             eq_str = phase_region.eq_str()
-            target_hyperplane = estimate_hyperplane(phase_region, parameters, approximate_equilibrium=approximate_equilibrium)
+            target_hyperplane, hyperplane_grads = estimate_hyperplane(phase_region, data['dbf'], data['parameter_dict'], parameters, approximate_equilibrium=approximate_equilibrium)
             if np.any(np.isnan(target_hyperplane)):
                 _log.debug('NaN target hyperplane. Equilibria: (%s), driving force: 0.0, reference: %s.', eq_str, dataset_ref)
                 data_driving_forces.extend([0]*len(phase_region.vertices))
                 data_weights.extend([weight]*len(phase_region.vertices))
+                data_gradients.extend([0]*len(phase_region.vertices))
                 continue
             # 2. Calculate the driving force to that hyperplane for each vertex
             for vertex in phase_region.vertices:
-                driving_force = driving_force_to_hyperplane(target_hyperplane, phase_region, vertex, parameters,
+                driving_force, df_grad = driving_force_to_hyperplane(target_hyperplane, hyperplane_grads, phase_region, data['dbf'], data['parameter_dict'], vertex, parameters,
                                                             approximate_equilibrium=approximate_equilibrium,
                                                             )
                 if np.isinf(driving_force) and short_circuit:
@@ -397,16 +424,18 @@ def calculate_zpf_driving_forces(zpf_data: Sequence[Dict[str, Any]],
                     return [[np.inf]], [[np.inf]]
                 data_driving_forces.append(driving_force)
                 data_weights.append(weight)
+                data_gradients.append(df_grad)
                 _log.debug('Equilibria: (%s), current phase: %s, hyperplane: %s, driving force: %s, reference: %s', eq_str, vertex.phase_name, target_hyperplane, driving_force, dataset_ref)
         driving_forces.append(data_driving_forces)
         weights.append(data_weights)
-    return driving_forces, weights
+        gradients.append(data_gradients)
+    return driving_forces, weights, gradients
 
 
 def calculate_zpf_error(zpf_data: Sequence[Dict[str, Any]],
                         parameters: np.ndarray = None,
                         data_weight: int = 1.0,
-                        approximate_equilibrium: bool = False) -> float:
+                        approximate_equilibrium: bool = False) -> Tuple[float, List[float]]:
     """
     Calculate the likelihood due to phase equilibria data.
 
@@ -420,15 +449,17 @@ def calculate_zpf_error(zpf_data: Sequence[Dict[str, Any]],
     """
     if len(zpf_data) == 0:
         return 0.0
-    driving_forces, weights = calculate_zpf_driving_forces(zpf_data, parameters, approximate_equilibrium, short_circuit=True)
+    driving_forces, weights, gradients = calculate_zpf_driving_forces(zpf_data, parameters, approximate_equilibrium, short_circuit=True)
     # Driving forces and weights are 2D ragged arrays with the shape (len(zpf_data), len(zpf_data['values']))
     driving_forces = np.concatenate(driving_forces)
     weights = np.concatenate(weights)
+    gradients = np.concatenate(gradients)
     if np.any(np.logical_or(np.isinf(driving_forces), np.isnan(driving_forces))):
         return -np.inf
     log_probabilites = norm.logpdf(driving_forces, loc=0, scale=1000/data_weight/weights)
+    grad_log_probs = -driving_forces.T*gradients.T/(1000/data_weight/weights)**2
     _log.debug('Data weight: %s, driving forces: %s, weights: %s, probabilities: %s', data_weight, driving_forces, weights, log_probabilites)
-    return np.sum(log_probabilites)
+    return np.sum(log_probabilites), np.sum(grad_log_probs, axis =1)
 
 
 class ZPFResidual(ResidualFunction):
@@ -465,9 +496,9 @@ class ZPFResidual(ResidualFunction):
         weights = np.concatenate(weights).tolist()
         return residuals, weights
 
-    def get_likelihood(self, parameters) -> float:
-        likelihood = calculate_zpf_error(self.zpf_data, parameters, data_weight=self.weight)
-        return likelihood
+    def get_likelihood(self, parameters) -> Tuple[float, List[float]]:
+        likelihood, gradients = calculate_zpf_error(self.zpf_data, parameters, data_weight=self.weight)
+        return likelihood, gradients
 
 
 residual_function_registry.register(ZPFResidual)
