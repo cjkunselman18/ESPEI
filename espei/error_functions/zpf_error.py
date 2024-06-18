@@ -162,8 +162,14 @@ def get_zpf_data(dbf: Database, comps: Sequence[str], phases: Sequence[str], dat
     desired_data = datasets.search((tinydb.where('output') == 'ZPF') &
                                    (tinydb.where('components').test(lambda x: set(x).issubset(comps))) &
                                    (tinydb.where('phases').test(lambda x: len(set(phases).intersection(x)) > 0)))
-    wks = Workspace(dbf, comps, phases, models=model, parameters=parameters)
+    wks = Workspace(dbf, comps, phases, models=model)
     
+    params_keys = []
+    for key in parameters.keys():
+        if not hasattr(v, key):
+            setattr(v, key, v.IndependentPotential(key))
+        params_keys.append(getattr(v, key))
+        dbf.symbols.pop(key,None)
 
     zpf_data = []  # 1:1 correspondence with each dataset
     for data in desired_data:
@@ -207,7 +213,7 @@ def get_zpf_data(dbf: Database, comps: Sequence[str], phases: Sequence[str], dat
                     has_missing_comp_cond = False
                     vertex_wks = current_wks.copy()
                     vertex_wks.phases = [phase_name]
-                    vertex_wks.conditions = {**pot_conds, **comp_conds}
+                    vertex_wks.conditions = {**pot_conds, **comp_conds, **parameters}
                     compset = next(vertex_wks.enumerate_composition_sets())[1][0]
                     phase_points = np.array([compset.dof[len(compset.phase_record.state_variables):]])
                     assert phase_points.shape[0] > 0, f"phase {phase_name} must have at least one set of points within the target tolerance {pot_conds} {comp_conds}"
@@ -256,16 +262,17 @@ def estimate_hyperplane(phase_region: PhaseRegion, dbf: Database, parameter_dict
     models = phase_region.models
     for vertex in phase_region.hyperplane_vertices:
         phase_records = vertex.phase_records
-        update_phase_record_parameters(phase_records, parameters)
+        #update_phase_record_parameters(phase_records, parameters)
         cond_dict = {**vertex.comp_conds, **phase_region.potential_conds}
         # can you append parameters as potentials in the conditions dict here?
-        params_keys = []
-        for key in parameter_dict.keys():
-            if not hasattr(v, key):
-                setattr(v, key, v.IndependentPotential(key))
-            params_keys.append(getattr(v, key))
-            dbf.symbols.pop(key,None)
+       # params_keys = []
+       # for key in parameter_dict.keys():
+        #    if not hasattr(v, key):
+        #        setattr(v, key, v.IndependentPotential(key))
+        #    params_keys.append(getattr(v, key))
+        #    dbf.symbols.pop(key,None)
             
+        params_keys = list(parameter_dict.keys())
         for index in range(len(parameters)):
             cond_dict.update({params_keys[index]: parameters[index]})
         
@@ -311,7 +318,7 @@ def driving_force_to_hyperplane(target_hyperplane_chempots: np.ndarray, target_h
     str_statevar_dict = OrderedDict([(str(key),cond_dict[key]) for key in sorted(phase_region.potential_conds.keys(), key=str)])
     phase_points = vertex.points
     phase_records = vertex.phase_records
-    update_phase_record_parameters(phase_records, parameters)
+    #update_phase_record_parameters(phase_records, parameters)
     if phase_points is None:
         # We don't have the phase composition here, so we estimate the driving force.
         # Can happen if one of the composition conditions is unknown or if the phase is
@@ -353,7 +360,6 @@ def driving_force_to_hyperplane(target_hyperplane_chempots: np.ndarray, target_h
         gradients = wks.get(*gradient_params)
         constrained_energy_gradient = [float(element.magnitude) for element in gradients]
         driving_force_gradient = np.squeeze(np.matmul(np.reshape(vertex.composition,(1,-1)),target_hyperplane_chempots_grads) - constrained_energy_gradient)
-        
         
     return driving_force, driving_force_gradient
 
@@ -451,13 +457,13 @@ def calculate_zpf_error(zpf_data: Sequence[Dict[str, Any]],
         return 0.0
     driving_forces, weights, gradients = calculate_zpf_driving_forces(zpf_data, parameters, approximate_equilibrium, short_circuit=True)
     # Driving forces and weights are 2D ragged arrays with the shape (len(zpf_data), len(zpf_data['values']))
-    driving_forces = np.concatenate(driving_forces)
+    driving_forces = np.concatenate(driving_forces).T
     weights = np.concatenate(weights)
     gradients = np.concatenate(gradients)
     if np.any(np.logical_or(np.isinf(driving_forces), np.isnan(driving_forces))):
         return -np.inf
     log_probabilites = norm.logpdf(driving_forces, loc=0, scale=1000/data_weight/weights)
-    grad_log_probs = -driving_forces.T*gradients.T/(1000/data_weight/weights)**2
+    grad_log_probs = -driving_forces*gradients.T/(1000/data_weight/weights)**2
     _log.debug('Data weight: %s, driving forces: %s, weights: %s, probabilities: %s', data_weight, driving_forces, weights, log_probabilites)
     return np.sum(log_probabilites), np.sum(grad_log_probs, axis =1)
 
