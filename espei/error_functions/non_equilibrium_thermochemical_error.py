@@ -15,6 +15,8 @@ from tinydb import where
 from pycalphad.codegen.phase_record_factory import PhaseRecordFactory
 from pycalphad import Database, Model, ReferenceState, variables as v
 from pycalphad.core.utils import unpack_components, get_pure_elements, filter_phases
+from pycalphad import Workspace, as_property
+from pycalphad.property_framework import DotDerivativeComputedProperty, IsolatedPhase
 
 from espei.datasets import Dataset
 from espei.core_utils import ravel_conditions, get_prop_data, filter_temperatures
@@ -202,7 +204,7 @@ def get_sample_condition_dicts(calculate_dict: Dict[Any, Any], configuration_tup
     return sample_condition_dicts
 
 
-def get_thermochemical_data(dbf, comps, phases, datasets, model=None, weight_dict=None, symbols_to_fit=None):
+def get_thermochemical_data(dbf, comps, phases, datasets, parameters, model=None, weight_dict=None, symbols_to_fit=None):
     """
 
     Parameters
@@ -227,6 +229,16 @@ def get_thermochemical_data(dbf, comps, phases, datasets, model=None, weight_dic
     list
         List of data dictionaries to iterate over
     """
+    params_keys = []
+
+    # XXX: This mutates the global pycalphad namespace
+    for key in parameters.keys():
+        if not hasattr(v, key):
+            setattr(v, key, v.IndependentPotential(key))
+        params_keys.append(getattr(v, key))
+        # XXX: Mutates argument to function
+        dbf.symbols.pop(key,None)
+    
     # phase by phase, then property by property, then by model exclusions
     if weight_dict is None:
         weight_dict = {}
@@ -283,7 +295,8 @@ def get_thermochemical_data(dbf, comps, phases, datasets, model=None, weight_dic
                 curr_data = filter_temperatures(curr_data)
                 calculate_dict = get_prop_samples(curr_data, constituents)
                 model_cls = model.get(phase_name, Model)
-                mod = model_cls(dbf, comps, phase_name, parameters=symbols_to_fit)
+                #mod = model_cls(dbf, comps, phase_name, parameters=symbols_to_fit)
+                mod = model_cls(dbf, comps, phase_name)
                 if prop.endswith('_FORM'):
                     output = ''.join(prop.split('_')[:-1])
                     mod.shift_reference_state(ref_states, dbf, contrib_mods={e: symengine.S.Zero for e in exclusion})
@@ -311,27 +324,70 @@ def get_thermochemical_data(dbf, comps, phases, datasets, model=None, weight_dic
                 data_dict['model'] = model_dict
                 data_dict['output'] = output
                 data_dict['weights'] = np.array(property_std_deviation[prop.split('_')[0]])/np.array(calculate_dict.pop('weights'))
+                data_dict['constituents'] = constituents
                 all_data_dicts.append(data_dict)
     return all_data_dicts
 
 
 
-def compute_fixed_configuration_property_differences(calc_data: FixedConfigurationCalculationData, parameters):
+def compute_fixed_configuration_property_differences(dbf, calc_data: FixedConfigurationCalculationData, parameters):
     phase_name = calc_data['phase_name']
     output = calc_data['output']
-    phase_records = calc_data['phase_records']
+    #phase_records = calc_data['phase_records']
     sample_values = calc_data['calculate_dict']['values']
+    
+    constituent_list = []
+    sublattice_list = []
+    counter = 0
+    for sublattice in calc_data['constituents']:
+        for const in sublattice:
+            sublattice_list.append(counter)
+            constituent_list.append(const)
+        counter = counter + 1
+      
+    differences = []
+    gradients = []
+    for index in range(len(sample_values)):
+        cond_dict = {**parameters}
+        dof = {}
+        for key in calc_data['str_statevar_dict'].keys():
+            cond_dict.update({key: calc_data['str_statevar_dict'][key][index]})
+        for site_frac in range(len(constituent_list)):
+            comp = constituent_list[site_frac]
+            occupancy = calc_data['calculate_dict']['points'][index,site_frac]
+            sublattice = sublattice_list[site_frac]
+            dof.update({v.Y(phase_name,sublattice,comp): occupancy})
+        
+            # need to relate the position in the vector of site fractions to the species
 
-    update_phase_record_parameters(phase_records, parameters)
-    results = calculate_(calc_data['species'], [phase_name],
-                            calc_data['str_statevar_dict'], calc_data['model'],
-                            phase_records, output=output, broadcast=False,
-                            points=calc_data['calculate_dict']['points'])[output]
-    differences = results - sample_values
-    return differences
+    #update_phase_record_parameters(phase_records, parameters)
+        wks = Workspace(database=dbf, components=calc_data['species'], phases=phase_name, conditions={**cond_dict, **dof})
+        ind_comps = len(calc_data['species']) - 1
+        if v.Species('VA') in calc_data['species']:
+            ind_comps = ind_comps - 1
+        for comp in calc_data['species']:
+            if v.Species(comp) != v.Species('VA') and ind_comps > 0:
+                wks.conditions[v.X(comp)] = float(wks.models['LAVES_C15'].moles(comp).xreplace(dof)) 
+                ind_comps = ind_comps - 1
+                
+        print(wks.get('NP(*)'))
+        print(wks.conditions)
+        results = wks.get(IsolatedPhase(phase_name, wks=wks)(output))[0]
+        gradient_props = [DotDerivativeComputedProperty(output, key) for key in parameters]
+        grads = wks.get(*gradient_props)
+        sample_gradients = [float(element) for element in grads]
+    #results = calculate_(calc_data['species'], [phase_name],
+    #                        calc_data['str_statevar_dict'], calc_data['model'],
+    #                        phase_records, output=output, broadcast=False,
+    #                        points=calc_data['calculate_dict']['points'])[output]
+        sample_differences = results - sample_values[index]
+        differences.append(sample_differences)
+        gradients.append(sample_gradients)
+    
+    return differences, gradients
 
 
-def calculate_non_equilibrium_thermochemical_probability(thermochemical_data: List[FixedConfigurationCalculationData], parameters=None):
+def calculate_non_equilibrium_thermochemical_probability(thermochemical_data: List[FixedConfigurationCalculationData], dbf, parameters=None):
     """
     Calculate the weighted single phase error in the Database
 
@@ -349,18 +405,23 @@ def calculate_non_equilibrium_thermochemical_probability(thermochemical_data: Li
 
     """
     if parameters is None:
-        parameters = np.array([])
+        parameters = {}
 
     prob_error = 0.0
+    overall_grad = np.zeros(len(parameters))
     for data in thermochemical_data:
         phase_name = data['phase_name']
         sample_values = data['calculate_dict']['values']
-        differences = compute_fixed_configuration_property_differences(data, parameters)
+        differences, gradients = compute_fixed_configuration_property_differences(dbf, data, parameters)
+        differences = np.concatenate(differences, axis=0)
+        gradients = np.array(gradients)
         probabilities = norm.logpdf(differences, loc=0, scale=data['weights'])
         prob_sum = np.sum(probabilities)
         _log.debug("%s(%s) - probability sum: %0.2f, data: %s, differences: %s, probabilities: %s, references: %s", data['prop'], phase_name, prob_sum, sample_values, differences, probabilities, data['calculate_dict']['references'])
         prob_error += prob_sum
-    return prob_error
+        grad_prob = np.sum(-differences*gradients.T/data['weights']**2, axis=1)
+        overall_grad += grad_prob
+    return prob_error, overall_grad
 
 
 class FixedConfigurationPropertyResidual(ResidualFunction):
@@ -388,7 +449,10 @@ class FixedConfigurationPropertyResidual(ResidualFunction):
         phases = sorted(filter_phases(database, unpack_components(database, comps), database.phases.keys()))
         if symbols_to_fit is None:
             symbols_to_fit = database_symbols_to_fit(database)
-        self.thermochemical_data = get_thermochemical_data(database, comps, phases, datasets, model_dict, weight_dict=self.weight, symbols_to_fit=symbols_to_fit)
+        parameters = dict(zip(symbols_to_fit, [0]*len(symbols_to_fit)))
+        self.thermochemical_data = get_thermochemical_data(database, comps, phases, datasets, parameters, model_dict, weight_dict=self.weight, symbols_to_fit=symbols_to_fit)
+        self._symbols_to_fit = symbols_to_fit
+        self.dbf = database
 
     def get_residuals(self, parameters: npt.ArrayLike) -> Tuple[List[float], List[float]]:
         residuals = []
@@ -404,9 +468,10 @@ class FixedConfigurationPropertyResidual(ResidualFunction):
             weights.extend(dataset_weights)
         return residuals, weights
 
-    def get_likelihood(self, parameters) -> float:
-        likelihood = calculate_non_equilibrium_thermochemical_probability(self.thermochemical_data, parameters)
-        return likelihood
+    def get_likelihood(self, parameters) -> Tuple[float, List[float]]:
+        parameters = {param_name: param for param_name, param in zip(self._symbols_to_fit, parameters.tolist())}
+        likelihood, gradient = calculate_non_equilibrium_thermochemical_probability(self.thermochemical_data, self.dbf, parameters)
+        return likelihood, gradient
 
 
 residual_function_registry.register(FixedConfigurationPropertyResidual)
